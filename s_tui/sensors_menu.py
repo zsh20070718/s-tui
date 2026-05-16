@@ -1,0 +1,157 @@
+#!/usr/bin/env python
+#
+# Copyright (C) 2017-2025 Alex Manuskin, Gil Tsuker
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+
+"""
+A class displaying all available sensors
+"""
+
+import urwid
+
+from s_tui.sturwid.ui_elements import ViListBox
+
+
+class SensorsMenu:
+    MAX_TITLE_LEN = 120
+
+    def on_mode_button(self, button, state):
+        pass
+
+    def __init__(self, return_fn, source_list, default_source_conf):
+        self.return_fn = return_fn
+
+        # create the cancel and apply buttons, and put the in an urwid column
+        cancel_button = urwid.Button("Cancel", on_press=self.on_cancel)
+        cancel_button._label.align = "center"
+        apply_button = urwid.Button("Apply", on_press=self.on_apply)
+        apply_button._label.align = "center"
+        if_buttons = urwid.Columns([apply_button, cancel_button])
+
+        self.sensor_status_dict = {}
+        sensor_column_list = []
+        selector_buttons_column_list = []
+        self.sensor_button_dict = {}
+        self.active_sensors = {}
+        for source in source_list:
+            source_name = source.get_source_name()
+
+            # Build per-sensor visibility from config dict (keyed by name)
+            conf = default_source_conf.get(source_name) or {}
+            self.sensor_status_dict[source_name] = []
+            for sensor in source.get_sensor_list():
+                # ConfigParser lowercases keys, so compare lowercase
+                self.sensor_status_dict[source_name].append(
+                    conf.get(sensor.lower(), True)
+                )
+
+            self.sensor_button_dict[source_name] = []
+            self.active_sensors[source_name] = []
+
+            # add the title at the head of the checkbox column
+            sensor_title_str = source_name
+            sensor_title = urwid.Text(("bold text", sensor_title_str), "center")
+
+            # create the checkbox buttons with the saved visibility
+            current_col_nr = 0
+            for sensor, s_tatus in zip(
+                source.get_sensor_list(), self.sensor_status_dict[source_name]
+            ):
+                cb = urwid.CheckBox(sensor, s_tatus)
+                self.sensor_button_dict[source_name].append(cb)
+                self.active_sensors[source_name].append(s_tatus)
+                current_col_nr += 1
+
+            col_selector_buttons = []
+            if current_col_nr > 0:
+                checkall_button = urwid.Button(
+                    "Check all",
+                    on_press=self.on_checkall_col,
+                    user_data=sensor_title_str,
+                )
+                # checkall_button._label.align = "center"
+                col_selector_buttons.append(checkall_button)
+                uncheckall_button = urwid.Button(
+                    "Uncheck all",
+                    on_press=self.on_uncheckall_col,
+                    user_data=sensor_title_str,
+                )
+                # uncheckall_button._label.align = "center"
+                col_selector_buttons.append(uncheckall_button)
+
+            sensor_title_and_buttons = [sensor_title] + self.sensor_button_dict[
+                source_name
+            ]
+            listw = urwid.SimpleFocusListWalker(sensor_title_and_buttons)
+            sensor_column_list.append(urwid.Pile(listw))
+
+            listw = urwid.SimpleFocusListWalker(col_selector_buttons)
+            selector_buttons_column_list.append(urwid.Pile(listw))
+
+        sensor_select_widget = urwid.Columns(sensor_column_list)
+        selector_buttons_widget = urwid.Columns(
+            selector_buttons_column_list, box_columns=[0, 1]
+        )
+
+        list_temp = [sensor_select_widget, selector_buttons_widget, if_buttons]
+        listw = urwid.SimpleFocusListWalker(list_temp)
+        self.main_window = urwid.LineBox(ViListBox(listw))
+
+        max_height = 6
+        for _, s_tatus in self.active_sensors.items():
+            max_height = max(max_height, len(s_tatus) + 6)
+
+        self.size = max_height, self.MAX_TITLE_LEN
+
+    def get_size(self):
+        return self.size
+
+    def set_checkbox_value(self):
+        for sensor, sensor_cb in self.sensor_button_dict.items():
+            sensor_cb_next_state = self.active_sensors[sensor]
+            for checkbox, state in zip(sensor_cb, sensor_cb_next_state):
+                checkbox.set_state(state)
+
+    def on_cancel(self, w):
+        self.set_checkbox_value()
+        self.return_fn(update=False)
+
+    def on_apply(self, w):
+        update_sensor_visibility = False
+        for s_name, sensor_buttons in self.sensor_button_dict.items():
+            cb_sensor_visibility = [
+                sensor_cb.get_state() for sensor_cb in sensor_buttons
+            ]
+
+            if cb_sensor_visibility != self.active_sensors[s_name]:
+                update_sensor_visibility = True
+
+            self.active_sensors[s_name] = cb_sensor_visibility
+
+        self.set_checkbox_value()
+        self.return_fn(update=update_sensor_visibility)
+
+    def setall_cb_col(self, w, col, state):
+        for s_name, sensor_buttons in self.sensor_button_dict.items():
+            if s_name == col:
+                for checkbox in sensor_buttons:
+                    checkbox.set_state(state)
+
+    def on_uncheckall_col(self, w, col):
+        self.setall_cb_col(self, col, False)
+
+    def on_checkall_col(self, w, col):
+        self.setall_cb_col(self, col, True)

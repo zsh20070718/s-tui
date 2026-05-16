@@ -1,0 +1,121 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2017-2025 Alex Manuskin, Maor Veitsman
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+"""This module implements a fan source"""
+
+from __future__ import annotations
+
+import logging
+
+import psutil
+
+from s_tui.sources.source import Source
+
+
+class FanSource(Source):
+    """Source for fan information"""
+
+    def __init__(self):
+        try:
+            if psutil.sensors_fans():
+                self.is_available = True
+        except AttributeError:
+            self.is_available = False
+            logging.debug("Fans sensors is not available from psutil")
+            return
+        except TypeError:
+            # psutil bug: sensors_fans() raises TypeError on some hardware
+            # when sysfs fan sensor files contain None (e.g. Intel xe GPU fans)
+            # See: https://github.com/amanusk/s-tui/issues/255
+            self.is_available = False
+            logging.debug("Fans sensors raised TypeError (psutil bug)")
+            return
+
+        Source.__init__(self)
+
+        self.name = "Fan"
+        self.measurement_unit = "RPM"
+        self.pallet = ("fan light", "fan dark", "fan light smooth", "fan dark smooth")
+
+        sensors_dict = {}
+        try:
+            sensors_dict = psutil.sensors_fans()
+        except (OSError, TypeError):
+            logging.debug("Unable to create sensors dict")
+            self.is_available = False
+            return
+        if not sensors_dict:
+            self.is_available = False
+            return
+
+        self._sensor_lookup = {}
+        for key, value in sensors_dict.items():
+            sensor_name = key
+            for sensor_idx, sensor in enumerate(value):
+                sensor_label = sensor.label
+
+                full_name = ""
+                if not sensor_label:
+                    full_name = sensor_name + "," + str(sensor_idx)
+                else:
+                    full_name = sensor_label
+
+                logging.debug("Fan sensor name %s", full_name)
+
+                self.available_sensors.append(full_name)
+                self._sensor_lookup[(key, sensor_idx)] = len(self.available_sensors) - 1
+
+        self.sensor_available = [True] * len(self.available_sensors)
+        self.last_measurement = [0] * len(self.available_sensors)
+
+    def update(self) -> None:
+        try:
+            sample = psutil.sensors_fans()
+        except (TypeError, OSError):
+            # psutil bug: sensors_fans() may raise TypeError on some hardware
+            # when sysfs fan sensor files contain None.
+            # See: https://github.com/amanusk/s-tui/issues/256
+            # Keep last_measurement unchanged (show stale data).
+            logging.debug("sensors_fans() raised an exception, keeping stale data")
+            return
+        if sample is None:
+            logging.debug("sensors_fans() returned None, keeping stale data")
+            return
+
+        updated = set()
+        for key, sensors in sample.items():
+            for sensor_idx, minor_sensor in enumerate(sensors):
+                idx = self._sensor_lookup.get((key, sensor_idx))
+                if idx is None:
+                    continue  # new sensor not in original list
+                if minor_sensor.current > 10000:
+                    self.sensor_available[idx] = False
+                    continue
+                self.last_measurement[idx] = int(minor_sensor.current)
+                self.sensor_available[idx] = True
+                updated.add(idx)
+
+        # Mark sensors not seen in this sample as unavailable
+        for idx in range(len(self.available_sensors)):
+            if idx not in updated:
+                self.sensor_available[idx] = False
+
+    def get_edge_triggered(self) -> bool:
+        return False
+
+    def get_top(self) -> int:
+        return 1

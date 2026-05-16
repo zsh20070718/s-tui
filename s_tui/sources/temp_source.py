@@ -1,0 +1,211 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2017-2025 Alex Manuskin, Gil Tzuker, Maor Veitsman
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+"""This module implements a Temperature source"""
+
+from __future__ import annotations
+
+import logging
+import warnings
+from collections import OrderedDict
+
+import psutil
+
+from s_tui.sources.source import Source
+
+
+class TempSource(Source):
+    """This class inherits a source and implements a temperature source"""
+
+    THRESHOLD_TEMP = 80
+
+    def __init__(self, temp_thresh: int | str | None = None) -> None:
+        warnings.filterwarnings(
+            "ignore",
+            ".*FileNotFound.*",
+        )
+        try:
+            sensors_data = psutil.sensors_temperatures()
+            if not sensors_data:
+                self.is_available = False
+                logging.debug("sensors_temperatures() returned empty/None")
+                return
+            self.is_available = True
+        except (AttributeError, OSError):
+            self.is_available = False
+            logging.debug("cpu temperature is not available from psutil")
+            return
+
+        Source.__init__(self)
+
+        self.name = "Temp"
+        self.measurement_unit = "C"
+        self.max_last_temp = 0
+        self.temp_thresh_is_set = False
+        self.pallet = (
+            "temp light",
+            "temp dark",
+            "temp light smooth",
+            "temp dark smooth",
+        )
+        self.alert_pallet = (
+            "high temp light",
+            "high temp dark",
+            "high temp light smooth",
+            "high temp dark smooth",
+        )
+
+        self.max_temp = 10
+        sensors_dict = None
+        try:
+            sensors_dict = OrderedDict(sorted(psutil.sensors_temperatures().items()))
+        except OSError:
+            logging.debug("Unable to create sensors dict")
+            self.is_available = False
+            return
+        self._sensor_lookup = {}
+        multi_sensors = []
+        for key, value in sensors_dict.items():
+            sensor_name = "".join(key.title().split(" "))
+            for sensor_idx, sensor in enumerate(value):
+                sensor_label = sensor.label
+                if sensor.current <= 1.0 or sensor.current >= 127.0:
+                    continue
+
+                full_name = ""
+                if not sensor_label:
+                    full_name = sensor_name + "," + str(sensor_idx)
+                else:
+                    full_name = "".join(sensor_label.title().split(" "))
+                    sensor_count = multi_sensors.count(full_name)
+                    multi_sensors.append(full_name)
+                    full_name += "," + str(sensor_count)
+
+                logging.debug("Temp sensor name %s", full_name)
+                self.available_sensors.append(full_name)
+                self._sensor_lookup[(key, sensor_idx)] = len(self.available_sensors) - 1
+
+        self.sensor_available = [True] * len(self.available_sensors)
+        self.last_measurement = [0.0] * len(self.available_sensors)
+
+        # Set temperature threshold if a custom one is set
+        self.temp_thresh = self.THRESHOLD_TEMP
+        if temp_thresh is not None:
+            self.temp_thresh_is_set = True
+            if int(temp_thresh) > 0:
+                self.temp_thresh = int(temp_thresh)
+                logging.debug("Updated custom threshold to %s", self.temp_thresh)
+
+        # Initialize individual thresholds
+        self.last_thresholds = [self.temp_thresh] * len(self.available_sensors)
+
+    def update(self) -> None:
+        try:
+            sensors_data = psutil.sensors_temperatures()
+        except OSError as e:
+            logging.debug("sensors_temperatures() raised %s, keeping stale data", e)
+            return
+
+        if sensors_data is None:
+            return
+
+        try:
+            sample = OrderedDict(sorted(sensors_data.items()))
+        except OSError:
+            return
+
+        updated = set()
+        for key, sensors in sample.items():
+            for sensor_idx, minor_sensor in enumerate(sensors):
+                idx = self._sensor_lookup.get((key, sensor_idx))
+                if idx is None:
+                    continue  # new sensor not in original list
+                if minor_sensor.current <= 1.0 or minor_sensor.current >= 127.0:
+                    self.sensor_available[idx] = False
+                    continue
+                self.last_measurement[idx] = minor_sensor.current
+                if (
+                    minor_sensor.high is not None
+                    and minor_sensor.high
+                    and minor_sensor.high < 127.0
+                    and self.temp_thresh_is_set is False
+                ):
+                    self.last_thresholds[idx] = minor_sensor.high
+                else:
+                    self.last_thresholds[idx] = self.temp_thresh
+                self.sensor_available[idx] = True
+                updated.add(idx)
+
+        # Mark sensors not seen in this sample as unavailable
+        for idx in range(len(self.available_sensors)):
+            if idx not in updated:
+                self.sensor_available[idx] = False
+
+        available_temps = [
+            self.last_measurement[i]
+            for i in range(len(self.available_sensors))
+            if self.sensor_available[i]
+        ]
+        if available_temps:
+            self.max_last_temp = max(available_temps)
+            # Call check for hooks
+            Source.update(self)
+
+    def get_edge_triggered(self) -> bool:
+        return self.max_last_temp > self.temp_thresh
+
+    def get_sensor_alerts(self) -> list[str | None]:
+        """Return per-sensor alert attributes matching graph bar coloring."""
+        triggered = self.max_last_temp > self.temp_thresh
+        alerts: list[str | None] = [None] * len(self.available_sensors)
+        for idx in range(len(self.available_sensors)):
+            if not self.sensor_available[idx]:
+                continue
+            thresh = self.last_thresholds[idx]
+            if (thresh is None and triggered) or (
+                thresh is not None and self.last_measurement[idx] > thresh
+            ):
+                alerts[idx] = "high temp txt"
+        return alerts
+
+    def get_max_triggered(self) -> bool:
+        """Returns whether the current temperature threshold is exceeded"""
+        return self.max_temp > self.temp_thresh
+
+    def reset(self) -> None:
+        self.max_temp = 10
+
+    def get_maximum(self) -> float:
+        raise NotImplementedError("Get maximum is not implemented")
+
+    def get_top(self) -> int:
+        # Cache the top temperature after first calculation
+        if hasattr(self, "_cached_top_temp"):
+            return self._cached_top_temp
+
+        top_temp = 10
+        available_temps = psutil.sensors_temperatures().values()
+        for temp in available_temps:
+            for temp_minor in temp:
+                if (
+                    temp_minor.high is not None
+                    and temp_minor.high > top_temp
+                    and temp_minor.critical is not None
+                ):
+                    top_temp = temp_minor.critical
+        self._cached_top_temp = int(min(top_temp, 99))
+        return self._cached_top_temp
