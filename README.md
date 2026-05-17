@@ -7,7 +7,7 @@
 - CPU 监控：温度、频率、利用率、RAPL 功率。
 - GPU/组件功率监控：新增 `CompPower` 数据源。
 - 风扇转速显示：保留原有 psutil fan RPM 读取能力。
-- 风扇控制菜单：默认禁用；只有显式传入 `--enable-fan-control` 才显示。
+- 风扇控制菜单：已禁用；本版本不再写任何风扇控制目标。
 - 终端一次性输出：`--terminal` 和 `--json` 已接入 `CompPower`。
 - 压测：保留上游内置 CPU stress 和外部 `stress`/`stress-ng` 支持。
 
@@ -26,13 +26,13 @@
 
 ### 风扇控制
 
-`Fan Control` 默认不显示。只有显式传入 `--enable-fan-control` 后，才会尝试暴露以下后端：
+`Fan Control` 已禁用。本版本不再自动暴露以下任何可写后端：
 
 - Dell iDRAC raw IPMI fan command，仅在 DMI 厂商信息包含 Dell 时显示。
 - Supermicro raw IPMI fan command，仅在 DMI 厂商信息包含 Supermicro 或 Super Micro 时显示。
 - 可写的 Linux hwmon PWM 控制文件：`pwmN` 和可选的 `pwmN_enable`。
 
-默认不会暴露任何风扇控制入口，因为部分机器的 hwmon PWM 可能实际控制 PSU 风扇或风扇板，而不是机箱风扇。确需测试时必须显式加 `--enable-fan-control`；手动风扇 duty 默认下限为 20%，可通过 `--min-fan-duty` 调整。
+不会暴露任何风扇控制入口，因为部分机器的 hwmon PWM 可能实际控制 PSU 风扇或风扇板，而不是机箱风扇。当前只保留风扇转速和风扇功耗的只读监控。
 
 ## 安装和运行
 
@@ -187,18 +187,14 @@ python -m s_tui.s_tui
 
 风扇调速可能影响机器散热。本版本采取以下保护：
 
-- 默认隐藏 `Fan Control`，不暴露任何风扇写入口。
-- 只有显式传入 `--enable-fan-control` 后，用户在 `Fan Control` 菜单里 Apply 才会写。
+- 不暴露任何风扇写入口。
+- 不自动发现 hwmon PWM 或 IPMI raw 风扇控制目标。
 - 手动 duty 必须在 `--min-fan-duty` 和 100% 之间，默认最低 20%。
 - Dell/Supermicro raw IPMI 控制只在 DMI 厂商匹配时显示。
 - 未知厂商机器不会暴露 Dell/Supermicro raw 目标。
 - Giga Computing 的 `fdu-gpu-1` 当前不会显示 raw IPMI fan target。
 
-在新机器上不建议使用风扇控制。如果确需测试，先确认目标不是 PSU 风扇或风扇板，再显式开启并把下限设高：
-
-```bash
-python -m s_tui.s_tui --enable-fan-control --min-fan-duty 40
-```
+在新机器上不使用本工具做风扇控制；请通过 BMC Web UI 或厂商文档确认具体风扇域后再操作。
 
 ## Upstream
 

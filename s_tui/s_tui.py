@@ -44,7 +44,6 @@ from s_tui.fan_control_menu import (
     MAX_FAN_DUTY,
     MIN_FAN_DUTY,
     FanControlMenu,
-    discover_fan_control_targets,
 )
 from s_tui.help_menu import HELP_MESSAGE, HelpMenu
 
@@ -488,24 +487,9 @@ class GraphView(urwid.WidgetPlaceholder):
             self._open_menu_overlay(self.power_profile_menu)
 
     def _create_fan_control_menu(self) -> FanControlMenu | None:
-        """Create the fan control menu if a backend is controllable."""
-        if not self.controller.enable_fan_control:
-            logging.info("Fan control disabled by default")
-            return None
-
-        targets = discover_fan_control_targets(
-            ipmitool_exe=self.controller.ipmitool_exe
-        )
-        menu = FanControlMenu(
-            return_fn=self.on_menu_close,
-            targets=targets,
-            ipmitool_exe=self.controller.ipmitool_exe,
-            min_duty=self.controller.min_fan_duty,
-        )
-        if not menu.is_controllable():
-            logging.info("Fan control menu: nothing controllable, hiding")
-            return None
-        return menu
+        """Keep fan control hidden; automatic target discovery is unsafe."""
+        logging.info("Fan control disabled: automatic targets may be PSU fans")
+        return None
 
     def on_fan_control_menu_open(self, widget):
         """Open Fan Control menu"""
@@ -906,7 +890,6 @@ class GraphController:
         self.powerprofilesctl_exe = which("powerprofilesctl")
         self.ipmitool_exe = which("ipmitool")
         self.min_fan_duty = args.min_fan_duty
-        self.enable_fan_control = args.enable_fan_control
 
         self.handle_mouse = not args.no_mouse
 
@@ -1193,13 +1176,6 @@ def get_args():
         type=_min_fan_duty_arg,
         default=MIN_FAN_DUTY,
         help="Minimum manual fan duty percent. Default: 20",
-    )
-    parser.add_argument(
-        "--enable-fan-control",
-        dest="enable_fan_control",
-        action="store_true",
-        default=False,
-        help="Enable fan control menu. Unsafe on unknown hardware; disabled by default.",
     )
     args = parser.parse_args()
     return args

@@ -35,7 +35,7 @@ At the bottom, all sensors reading are presented in text form.\n\
 options>\n\
 * Select graphs to display in the <Graphs> menu \n\
 * Select summaries to display in the <Summaries> menu \n\
-* Fan Control is hidden unless --enable-fan-control is passed explicitly\n\
+* Fan Control is disabled; this build does not write fan controls\n\
 * Change time between updates using the 'Refresh' field\n\
 * Use the <Reset> button to reset graphs and statistics\n\
 * If your system supports it, you can use the UTF-8 button to get a smoother \
@@ -56,8 +56,8 @@ Throttle indicators (shown on frequency labels):\n\
 \n\
 Component power and fan control:\n\
   CompPower reads hwmon, nvidia-smi, and IPMI/DCMI watt sensors.\n\
-  Fan Control is disabled by default because hwmon PWM targets may control PSU fans.\n\
-  Manual fan duty is clamped by --min-fan-duty when fan control is enabled.\n\
+  Fan Control is disabled because automatic targets may control PSU fans.\n\
+  Fan RPM and fan power readings are still monitor-only.\n\
 """
 
 MESSAGE_LEN = 40
