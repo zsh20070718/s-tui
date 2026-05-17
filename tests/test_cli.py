@@ -27,6 +27,7 @@ class TestGetArgs:
         assert args.t_thresh is None
         assert args.refresh_rate == "2.0"
         assert args.min_fan_duty == 20
+        assert args.enable_fan_control is False
 
     def test_debug_flag(self):
         args = self._parse(["-d"])
@@ -75,6 +76,10 @@ class TestGetArgs:
     def test_min_fan_duty_rejects_out_of_range(self):
         with pytest.raises(SystemExit):
             self._parse(["--min-fan-duty", "101"])
+
+    def test_enable_fan_control(self):
+        args = self._parse(["--enable-fan-control"])
+        assert args.enable_fan_control is True
 
     def test_debug_file(self):
         args = self._parse(["--debug-file", "/tmp/test.log"])
