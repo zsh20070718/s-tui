@@ -15,7 +15,6 @@ import time
 from dataclasses import dataclass
 from threading import Lock
 
-
 _NVIDIA_SMI = shutil.which("nvidia-smi")
 _QUERY_FIELDS = (
     "index",

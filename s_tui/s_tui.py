@@ -40,7 +40,6 @@ import urwid
 from s_tui.about_menu import AboutMenu
 from s_tui.builtin_stress_menu import BuiltinStressMenu
 from s_tui.builtin_stresser import BuiltinStresser
-from s_tui.gpu_stresser import GpuStresser
 from s_tui.fan_control_menu import (
     MAX_FAN_DUTY,
     MIN_FAN_DUTY,
@@ -48,6 +47,7 @@ from s_tui.fan_control_menu import (
     discover_fan_control_targets,
 )
 from s_tui.fan_diagnostics import build_fan_diagnostics
+from s_tui.gpu_stresser import GpuStresser
 from s_tui.help_menu import HELP_MESSAGE, HelpMenu
 
 # Helpers
