@@ -20,22 +20,35 @@
 
 from __future__ import annotations
 
+import contextlib
 import glob
+import http.cookiejar
+import json
 import logging
 import os
 import re
+import ssl
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 
 import urwid
 
 from s_tui.helper_functions import cat, which
+from s_tui.ipmi import discover_bmc_ip, ipmitool_extra_args
 from s_tui.sturwid.ui_elements import ViListBox
 
-MIN_FAN_DUTY = 20
+MIN_FAN_DUTY = 0
 MAX_FAN_DUTY = 100
 IPMI_TIMEOUT = 5.0
+BMC_TIMEOUT = 8.0
+BMC_URL_ENV = "S_TUI_BMC_URL"
+BMC_USERNAME_ENV = "S_TUI_BMC_USERNAME"
+BMC_PASSWORD_ENV = "S_TUI_BMC_PASSWORD"
+BMC_VERIFY_TLS_ENV = "S_TUI_BMC_VERIFY_TLS"
 _PWM_RE = re.compile(r"pwm(\d+)$")
 
 
@@ -49,6 +62,7 @@ class FanControlTarget:
     zone: int | None = None
     pwm_path: str | None = None
     enable_path: str | None = None
+    bmc_base_url: str | None = None
 
 
 def _read_text(path: str, fallback: str = "") -> str:
@@ -103,17 +117,309 @@ def _run_ipmi_commands(
             raise OSError(f"{' '.join(cmd)} failed: {detail}")
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _normalize_bmc_base_url(value: str) -> str:
+    base_url = value.strip().rstrip("/")
+    if not base_url:
+        raise OSError(f"{BMC_URL_ENV} is empty")
+    if not re.match(r"^https?://", base_url):
+        base_url = f"https://{base_url}"
+    return base_url
+
+
+_discovered_bmc_base_url: str | None = None
+
+
+def _discover_bmc_base_url() -> str:
+    global _discovered_bmc_base_url
+
+    if _discovered_bmc_base_url is not None:
+        return _discovered_bmc_base_url
+
+    address = discover_bmc_ip()
+    if address is None:
+        raise OSError(
+            f"Set {BMC_URL_ENV}, or allow sudo for `ipmitool lan print`"
+        )
+    _discovered_bmc_base_url = _normalize_bmc_base_url(address)
+    logging.info(
+        "Discovered BMC URL %s via local IPMI LAN settings",
+        _discovered_bmc_base_url,
+    )
+    return _discovered_bmc_base_url
+
+
+def _configured_bmc_base_url(target: FanControlTarget | None) -> str | None:
+    base_url = (target.bmc_base_url if target is not None else None) or os.environ.get(
+        BMC_URL_ENV,
+        "",
+    )
+    if base_url.strip():
+        return _normalize_bmc_base_url(base_url)
+    return None
+
+
+def _candidate_bmc_base_urls(target: FanControlTarget | None) -> list[str]:
+    candidates = []
+    configured = _configured_bmc_base_url(target)
+    if configured is not None:
+        candidates.append(configured)
+
+    try:
+        discovered = _discover_bmc_base_url()
+    except OSError:
+        discovered = None
+    if discovered is not None and discovered not in candidates:
+        candidates.append(discovered)
+
+    if candidates:
+        return candidates
+    raise OSError(
+        f"Set {BMC_URL_ENV}, or allow sudo for `ipmitool lan print`"
+    )
+
+
+def _configured_or_discovered_bmc_base_url(target: FanControlTarget | None) -> str:
+    configured = _configured_bmc_base_url(target)
+    if configured is not None:
+        return configured
+    return _discover_bmc_base_url()
+
+
+class _InspurBmcClient:
+    def __init__(self, base_url: str, verify_tls: bool = False) -> None:
+        context = None if verify_tls else ssl._create_unverified_context()
+        self.base_url = _normalize_bmc_base_url(base_url)
+        self.csrf_token: str | None = None
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=context),
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+        )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> object:
+        request_headers = {"Accept": "application/json"}
+        if headers is not None:
+            request_headers.update(headers)
+        if self.csrf_token is not None:
+            request_headers["X-CSRFTOKEN"] = self.csrf_token
+
+        url = self.base_url + (path if path.startswith("/") else f"/{path}")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers=request_headers,
+            method=method,
+        )
+        try:
+            with self.opener.open(request, timeout=BMC_TIMEOUT) as response:
+                text = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+            raise OSError(f"BMC {path} returned HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise OSError(f"BMC {path} failed: {exc.reason}") from exc
+
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise OSError(f"BMC {path} returned non-JSON data") from exc
+        return payload
+
+    def _request_dict(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        payload = self._request(method, path, body, headers)
+        if not isinstance(payload, dict):
+            raise OSError(f"BMC {path} returned unexpected data")
+        return payload
+
+    def form(
+        self, method: str, path: str, payload: dict[str, object]
+    ) -> dict[str, object]:
+        body = urllib.parse.urlencode(payload).encode()
+        return self._request_dict(
+            method,
+            path,
+            body=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    def json(
+        self, method: str, path: str, payload: dict[str, object]
+    ) -> dict[str, object]:
+        body = json.dumps(payload).encode()
+        return self._request_dict(
+            method,
+            path,
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+    def get_json(self, path: str) -> dict[str, object]:
+        return self._request_dict("GET", path)
+
+    def get_payload(self, path: str) -> object:
+        return self._request("GET", path)
+
+
+_inspur_bmc_client_cache_key: tuple[str, str, str, bool] | None = None
+_inspur_bmc_client_cache: _InspurBmcClient | None = None
+
+
+def _inspur_bmc_credentials(
+    target: FanControlTarget | None,
+) -> tuple[str, str, str, bool]:
+    username = os.environ.get(BMC_USERNAME_ENV, "")
+    password = os.environ.get(BMC_PASSWORD_ENV, "")
+    if not username or not password:
+        raise OSError(
+            f"Set {BMC_USERNAME_ENV} and {BMC_PASSWORD_ENV} to control Inspur BMC fans"
+        )
+    return (
+        _configured_or_discovered_bmc_base_url(target),
+        username,
+        password,
+        _env_flag(BMC_VERIFY_TLS_ENV, default=False),
+    )
+
+
+def _inspur_bmc_auth() -> tuple[str, str, bool]:
+    username = os.environ.get(BMC_USERNAME_ENV, "")
+    password = os.environ.get(BMC_PASSWORD_ENV, "")
+    if not username or not password:
+        raise OSError(
+            f"Set {BMC_USERNAME_ENV} and {BMC_PASSWORD_ENV} to control Inspur BMC fans"
+        )
+    return username, password, _env_flag(BMC_VERIFY_TLS_ENV, default=False)
+
+
+def _inspur_bmc_is_configured(target: FanControlTarget | None = None) -> bool:
+    if not os.environ.get(BMC_USERNAME_ENV, "").strip():
+        return False
+    if not os.environ.get(BMC_PASSWORD_ENV, "").strip():
+        return False
+    try:
+        _candidate_bmc_base_urls(target)
+    except OSError:
+        return False
+    return True
+
+
+def _login_inspur_bmc(
+    target: FanControlTarget,
+    client_factory: Callable[[str, bool], _InspurBmcClient] = _InspurBmcClient,
+) -> _InspurBmcClient:
+    username, password, verify_tls = _inspur_bmc_auth()
+    errors = []
+
+    for base_url in _candidate_bmc_base_urls(target):
+        try:
+            client = client_factory(base_url, verify_tls)
+            random_tag = client.get_json("/api/randomtag")
+            encrypt_ctrl = int(random_tag.get("encrypt_ctrl", 0))
+            if encrypt_ctrl != 0:
+                raise OSError(
+                    "BMC requires encrypted login; this backend supports plain API login"
+                )
+
+            login = client.form(
+                "POST",
+                "/api/session",
+                {
+                    "encrypt_flag": encrypt_ctrl,
+                    "username": username,
+                    "password": password,
+                    "login_tag": random_tag.get("random", ""),
+                },
+            )
+            if login.get("ok") != 0:
+                raise OSError(f"BMC login failed: {login.get('error', 'unknown error')}")
+            csrf_token = login.get("CSRFToken")
+            if not isinstance(csrf_token, str) or not csrf_token:
+                raise OSError("BMC login did not return a CSRF token")
+            client.csrf_token = csrf_token
+            return client
+        except OSError as exc:
+            errors.append(f"{base_url}: {exc}")
+            logging.debug("Failed to log in to BMC API at %s", base_url, exc_info=True)
+
+    raise OSError(
+        "BMC login failed for all candidate URLs: " + "; ".join(errors)
+    )
+
+
+def _cached_inspur_bmc_client(
+    target: FanControlTarget | None = None,
+) -> _InspurBmcClient:
+    global _inspur_bmc_client_cache, _inspur_bmc_client_cache_key
+
+    if target is None:
+        target = FanControlTarget("bmc:inspur:all", "BMC Inspur all fans", "bmc-inspur")
+    username, password, verify_tls = _inspur_bmc_auth()
+    candidates = _candidate_bmc_base_urls(target)
+    if _inspur_bmc_client_cache is not None:
+        for base_url in candidates:
+            if _inspur_bmc_client_cache_key == (base_url, username, password, verify_tls):
+                return _inspur_bmc_client_cache
+
+    _inspur_bmc_client_cache = _login_inspur_bmc(target)
+    _inspur_bmc_client_cache_key = (
+        _inspur_bmc_client_cache.base_url,
+        username,
+        password,
+        verify_tls,
+    )
+    return _inspur_bmc_client_cache
+
+
+def read_inspur_bmc_payload(path: str) -> object | None:
+    """Read an Inspur BMC API payload when BMC credentials are configured."""
+    global _inspur_bmc_client_cache, _inspur_bmc_client_cache_key
+
+    if not _inspur_bmc_is_configured():
+        return None
+    try:
+        return _cached_inspur_bmc_client().get_payload(path)
+    except OSError:
+        _inspur_bmc_client_cache = None
+        _inspur_bmc_client_cache_key = None
+        logging.debug("Failed to read BMC API %s", path, exc_info=True)
+        return None
+
+
 def build_ipmi_commands(
     target: FanControlTarget,
     mode: str,
     duty_percent: int,
     ipmitool_exe: str,
     min_duty: int = MIN_FAN_DUTY,
+    ipmi_args: list[str] | None = None,
 ) -> list[list[str]]:
     """Build raw ipmitool commands for a supported BMC target."""
+    args = [] if ipmi_args is None else ipmi_args
+
+    def cmd(*subcommands: str) -> list[str]:
+        return [ipmitool_exe, *args, *subcommands]
+
     if target.kind == "ipmi-dell":
         if mode == "auto":
-            return [[ipmitool_exe, "raw", "0x30", "0x30", "0x01", "0x01"]]
+            return [cmd("raw", "0x30", "0x30", "0x01", "0x01")]
         if mode in {"manual", "full"}:
             selected_duty = (
                 MAX_FAN_DUTY
@@ -121,30 +427,28 @@ def build_ipmi_commands(
                 else _parse_duty_percent(duty_percent, min_duty)
             )
             return [
-                [ipmitool_exe, "raw", "0x30", "0x30", "0x01", "0x00"],
-                [
-                    ipmitool_exe,
+                cmd("raw", "0x30", "0x30", "0x01", "0x00"),
+                cmd(
                     "raw",
                     "0x30",
                     "0x30",
                     "0x02",
                     "0xff",
                     _hex_byte(selected_duty),
-                ],
+                ),
             ]
 
     if target.kind == "ipmi-supermicro":
         zone = target.zone if target.zone is not None else 0
         if mode == "auto":
-            return [[ipmitool_exe, "raw", "0x30", "0x45", "0x01", "0x00"]]
+            return [cmd("raw", "0x30", "0x45", "0x01", "0x00")]
         if mode == "full":
-            return [[ipmitool_exe, "raw", "0x30", "0x45", "0x01", "0x01"]]
+            return [cmd("raw", "0x30", "0x45", "0x01", "0x01")]
         if mode == "manual":
             duty = _parse_duty_percent(duty_percent, min_duty)
             return [
-                [ipmitool_exe, "raw", "0x30", "0x45", "0x01", "0x01"],
-                [
-                    ipmitool_exe,
+                cmd("raw", "0x30", "0x45", "0x01", "0x01"),
+                cmd(
                     "raw",
                     "0x30",
                     "0x70",
@@ -152,7 +456,7 @@ def build_ipmi_commands(
                     "0x01",
                     _hex_byte(zone),
                     _hex_byte(duty),
-                ],
+                ),
             ]
 
     raise ValueError(f"Unsupported fan control mode '{mode}' for {target.label}")
@@ -184,6 +488,56 @@ def _apply_hwmon_target(
     writer(target.pwm_path, str(_percent_to_pwm(duty)))
 
 
+def _apply_inspur_bmc_target(
+    target: FanControlTarget,
+    mode: str,
+    duty_percent: int,
+    min_duty: int = MIN_FAN_DUTY,
+    client_factory: Callable[[str, bool], _InspurBmcClient] = _InspurBmcClient,
+) -> None:
+    client = _login_inspur_bmc(target, client_factory=client_factory)
+
+    if mode == "auto":
+        client.json(
+            "PUT",
+            "/api/settings/fans-mode",
+            {"control_mode": "auto", "cooling_mode": "normal"},
+        )
+        return
+
+    if mode not in {"manual", "full"}:
+        raise ValueError(f"Unsupported fan control mode '{mode}'")
+
+    duty = (
+        MAX_FAN_DUTY if mode == "full" else _parse_duty_percent(duty_percent, min_duty)
+    )
+    client.json(
+        "PUT",
+        "/api/settings/fans-mode",
+        {"control_mode": "manual", "cooling_mode": "normal"},
+    )
+    fan_info = client.get_json("/api/status/fan_info")
+    fans = fan_info.get("fans")
+    if not isinstance(fans, list):
+        raise OSError("BMC did not return a fan list")
+
+    fan_ids = []
+    for fan in fans:
+        if not isinstance(fan, dict):
+            continue
+        if fan.get("is_disable") or fan.get("status") == "Absent":
+            continue
+        fan_id = fan.get("id")
+        if fan_id is not None:
+            fan_ids.append(fan_id)
+
+    if not fan_ids:
+        raise OSError("BMC returned no controllable fans")
+
+    for fan_id in fan_ids:
+        client.json("PUT", f"/api/settings/fan/{fan_id}", {"duty": duty})
+
+
 def apply_fan_target(
     target: FanControlTarget,
     mode: str,
@@ -197,12 +551,23 @@ def apply_fan_target(
         exe = ipmitool_exe or which("ipmitool")
         if exe is None:
             raise OSError("ipmitool is not installed")
-        commands = build_ipmi_commands(target, mode, duty_percent, exe, min_duty)
+        commands = build_ipmi_commands(
+            target,
+            mode,
+            duty_percent,
+            exe,
+            min_duty,
+            ipmi_args=ipmitool_extra_args(),
+        )
         _run_ipmi_commands(commands, runner)
         return
 
     if target.kind == "hwmon":
         _apply_hwmon_target(target, mode, duty_percent, min_duty)
+        return
+
+    if target.kind == "bmc-inspur":
+        _apply_inspur_bmc_target(target, mode, duty_percent, min_duty)
         return
 
     raise ValueError(f"Unsupported fan control target '{target.kind}'")
@@ -254,13 +619,33 @@ def _read_dmi_identity(base_path: str = "/sys/class/dmi/id") -> str:
 def _discover_ipmi_targets(
     ipmitool_exe: str | None = None,
     dmi_base_path: str = "/sys/class/dmi/id",
+    ipmi_vendor: str = "auto",
 ) -> list[FanControlTarget]:
+    forced_vendor = ipmi_vendor.strip().lower()
+    identity = (
+        forced_vendor if forced_vendor != "auto" else _read_dmi_identity(dmi_base_path)
+    )
+    targets = []
+    if "inspur" in identity or "inagile" in identity:
+        base_url = None
+        with contextlib.suppress(OSError):
+            base_url = _configured_or_discovered_bmc_base_url(None)
+        label = "BMC Inspur all fans"
+        if base_url:
+            label = f"{label} ({base_url})"
+        targets.append(
+            FanControlTarget(
+                "bmc:inspur:all",
+                label,
+                "bmc-inspur",
+                bmc_base_url=base_url,
+            )
+        )
+
     exe = ipmitool_exe or which("ipmitool")
     if exe is None:
-        return []
+        return targets
 
-    identity = _read_dmi_identity(dmi_base_path)
-    targets = []
     if "dell" in identity:
         targets.append(FanControlTarget("ipmi:dell", "IPMI Dell iDRAC", "ipmi-dell"))
     if "supermicro" in identity or "super micro" in identity:
@@ -287,9 +672,16 @@ def discover_fan_control_targets(
     ipmitool_exe: str | None = None,
     hwmon_base_path: str = "/sys/class/hwmon",
     dmi_base_path: str = "/sys/class/dmi/id",
+    allow_unsafe: bool = False,
+    ipmi_vendor: str = "auto",
 ) -> list[FanControlTarget]:
-    """Return no targets; automatic fan control discovery is unsafe."""
-    return []
+    """Return fan control targets only after explicit user opt-in."""
+    if not allow_unsafe:
+        return []
+    targets = []
+    targets.extend(_discover_hwmon_targets(hwmon_base_path))
+    targets.extend(_discover_ipmi_targets(ipmitool_exe, dmi_base_path, ipmi_vendor))
+    return targets
 
 
 class FanControlMenu:
@@ -314,7 +706,7 @@ class FanControlMenu:
         self.mode_values: list[str] = []
         self.target_buttons: list[urwid.AttrMap] = []
         self.mode_buttons: list[urwid.AttrMap] = []
-        self.duty_edit = urwid.Edit(f"Duty [% {min_duty}-100]: ", "50")
+        self.duty_edit = urwid.IntEdit(f"Manual duty [% {min_duty}-100]: ", 50)
 
         self.titles: list[urwid.Widget] = []
         self._build_ui()
@@ -357,21 +749,26 @@ class FanControlMenu:
         self.titles.extend(
             [
                 self.duty_edit,
-                urwid.Text(
-                    (
-                        "high temp txt",
-                        "Manual mode writes fan controls immediately.",
-                    )
-                ),
+                urwid.Text(("high temp txt", "Manual duty accepts any integer 0-100.")),
                 self.status_text,
             ]
         )
 
-        apply_button = urwid.Button("Apply", on_press=self.on_apply)
+        set_duty_button = urwid.Button("Set Duty", on_press=self.on_set_duty)
+        set_duty_button._label.align = "center"
+        auto_button = urwid.Button("Auto", on_press=self.on_auto)
+        auto_button._label.align = "center"
+        full_button = urwid.Button("Full", on_press=self.on_full)
+        full_button._label.align = "center"
+        apply_button = urwid.Button("Apply Selected", on_press=self.on_apply)
         apply_button._label.align = "center"
         close_button = urwid.Button("Close", on_press=self.on_close)
         close_button._label.align = "center"
-        self.titles.append(urwid.Columns([apply_button, close_button]))
+        self.titles.append(
+            urwid.Columns(
+                [set_duty_button, auto_button, full_button, apply_button, close_button]
+            )
+        )
 
     def get_size(self) -> tuple[int, int]:
         return len(self.titles) + 5, self.MAX_TITLE_LEN
@@ -391,13 +788,12 @@ class FanControlMenu:
                 return mode
         return "auto"
 
-    def on_apply(self, _: object) -> None:
+    def _apply_mode(self, mode: str) -> None:
         target = self._get_selected_target()
         if target is None:
             self.status_text.set_text(("high temp txt", "No fan target selected"))
             return
 
-        mode = self._get_selected_mode()
         duty_text = self.duty_edit.edit_text
         try:
             if mode == "manual":
@@ -419,6 +815,18 @@ class FanControlMenu:
             return
 
         self.status_text.set_text(f"Applied {mode} to {target.label}")
+
+    def on_set_duty(self, _: object) -> None:
+        self._apply_mode("manual")
+
+    def on_auto(self, _: object) -> None:
+        self._apply_mode("auto")
+
+    def on_full(self, _: object) -> None:
+        self._apply_mode("full")
+
+    def on_apply(self, _: object) -> None:
+        self._apply_mode(self._get_selected_mode())
 
     def on_close(self, _: object) -> None:
         self.return_fn()

@@ -33,22 +33,20 @@ import logging
 import os
 import re
 import subprocess
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from io import StringIO
 
+from s_tui.fan_control_menu import read_inspur_bmc_payload
 from s_tui.helper_functions import cat, which
+from s_tui.ipmi import build_ipmitool_command, ipmi_access_configured, run_ipmi_sensor
 from s_tui.sources.source import Source
 
 PROBE_TIMEOUT = 2.0
 IPMI_SENSOR_TIMEOUT = 10.0
-IPMI_SENSOR_CACHE_SECONDS = 10.0
+IPMI_SENSOR_CACHE_SECONDS = 0.5
 _POWER_INPUT_RE = re.compile(r"power(\d+)_input$")
 _FLOAT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
-_ipmi_sensor_cache_key: str | None = None
-_ipmi_sensor_cache_time = 0.0
-_ipmi_sensor_cache_result: subprocess.CompletedProcess[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -166,37 +164,27 @@ def _read_ipmi_sensor_power(
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> list[PowerReading]:
     """Read IPMI sensor rows whose unit is watts."""
-    global _ipmi_sensor_cache_key, _ipmi_sensor_cache_result, _ipmi_sensor_cache_time
-
     exe = ipmitool_exe or which("ipmitool")
     if exe is None:
         return []
+    if runner is subprocess.run and not ipmi_access_configured():
+        logging.debug("IPMI access is not configured for power sensor readings")
+        return []
 
     try:
-        now = time.monotonic()
-        if (
-            runner is subprocess.run
-            and _ipmi_sensor_cache_key == exe
-            and _ipmi_sensor_cache_result is not None
-            and now - _ipmi_sensor_cache_time < IPMI_SENSOR_CACHE_SECONDS
-        ):
-            result = _ipmi_sensor_cache_result
-        else:
-            result = runner(
-                [exe, "sensor"],
-                capture_output=True,
-                text=True,
-                timeout=IPMI_SENSOR_TIMEOUT,
-            )
-            if runner is subprocess.run and result.returncode == 0:
-                _ipmi_sensor_cache_key = exe
-                _ipmi_sensor_cache_result = result
-                _ipmi_sensor_cache_time = now
+        result = run_ipmi_sensor(
+            exe,
+            runner=runner,
+            timeout=IPMI_SENSOR_TIMEOUT,
+            cache_seconds=IPMI_SENSOR_CACHE_SECONDS,
+        )
     except subprocess.TimeoutExpired:
         logging.debug("ipmitool sensor timed out for component power", exc_info=True)
         return []
     except (OSError, subprocess.SubprocessError):
         logging.debug("Unable to run ipmitool sensor for power", exc_info=True)
+        return []
+    if result is None:
         return []
     if result.returncode != 0:
         logging.debug("ipmitool sensor failed: %s", result.stderr.strip())
@@ -225,10 +213,16 @@ def _read_ipmi_dcmi_power(
     exe = ipmitool_exe or which("ipmitool")
     if exe is None:
         return []
+    if runner is subprocess.run and not ipmi_access_configured():
+        logging.debug("IPMI access is not configured for DCMI power readings")
+        return []
 
     try:
+        cmd = build_ipmitool_command(["dcmi", "power", "reading"], exe)
+        if cmd is None:
+            return []
         result = runner(
-            [exe, "dcmi", "power", "reading"],
+            cmd,
             capture_output=True,
             text=True,
             timeout=PROBE_TIMEOUT,
@@ -249,11 +243,48 @@ def _read_ipmi_dcmi_power(
     return []
 
 
+def _bmc_sensor_is_available(sensor: dict[str, object]) -> bool:
+    accessible = sensor.get("accessible")
+    if accessible not in (None, 0, "0"):
+        return False
+    return sensor.get("sensor_state", 1) not in (0, "0", "N/A", "na")
+
+
+def _read_inspur_bmc_power(
+    payload_reader: Callable[[str], object | None] = read_inspur_bmc_payload,
+) -> list[PowerReading]:
+    """Read watt sensors from the Inspur BMC Web API."""
+    payload = payload_reader("/api/sensors/temAndPowerReading")
+    if not isinstance(payload, list):
+        return []
+
+    readings = []
+    for sensor in payload:
+        if not isinstance(sensor, dict):
+            continue
+        unit = str(sensor.get("unit", "")).lower()
+        if "watt" not in unit and unit != "w":
+            continue
+        if not _bmc_sensor_is_available(sensor):
+            continue
+        watts = _first_float(str(sensor.get("reading", "")))
+        if watts is None:
+            continue
+        readings.append(
+            PowerReading(_safe_label(f"BMC:{sensor.get('name', 'power')}"), watts)
+        )
+    return readings
+
+
 def _probe_power_readings() -> list[PowerReading]:
     """Return component power readings from all supported providers."""
     readings = []
     readings.extend(_read_hwmon_power())
     readings.extend(_read_nvidia_power())
+    bmc_readings = _read_inspur_bmc_power()
+    if bmc_readings:
+        readings.extend(bmc_readings)
+        return _dedupe_readings(readings)
     readings.extend(_read_ipmi_sensor_power())
     readings.extend(_read_ipmi_dcmi_power())
     return _dedupe_readings(readings)

@@ -77,6 +77,8 @@ def test_cpu_gpu_power_uses_rapl_package_and_gpu_readings():
 
     totals = collect_power_totals([rapl, component])
 
+    assert totals.cpu == 350.0
+    assert totals.gpu == 125.0
     assert totals.cpu_gpu == 475.0
 
 
@@ -89,6 +91,8 @@ def test_cpu_gpu_power_falls_back_to_component_cpu():
 
     totals = collect_power_totals([source])
 
+    assert totals.cpu == 120.0
+    assert totals.gpu == 250.0
     assert totals.cpu_gpu == 370.0
 
 
@@ -103,6 +107,8 @@ def test_unavailable_and_invalid_readings_are_ignored():
     totals = collect_power_totals([source])
 
     assert totals.machine is None
+    assert totals.cpu is None
+    assert totals.gpu is None
     assert totals.cpu_gpu is None
     assert totals.fan == 20.0
 

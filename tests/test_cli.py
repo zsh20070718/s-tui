@@ -25,8 +25,12 @@ class TestGetArgs:
         assert args.no_mouse is False
         assert args.debug_run is False
         assert args.t_thresh is None
-        assert args.refresh_rate == "2.0"
-        assert args.min_fan_duty == 20
+        assert args.refresh_rate == "0.5"
+        assert args.min_fan_duty == 0
+        assert args.fan_diagnostics is False
+        assert args.enable_fan_control is False
+        assert args.fan_control_vendor == "auto"
+        assert args.classic_ui is False
 
     def test_debug_flag(self):
         args = self._parse(["-d"])
@@ -72,9 +76,35 @@ class TestGetArgs:
         args = self._parse(["--min-fan-duty", "35"])
         assert args.min_fan_duty == 35
 
+    def test_min_fan_duty_allows_zero(self):
+        args = self._parse(["--min-fan-duty", "0"])
+        assert args.min_fan_duty == 0
+
     def test_min_fan_duty_rejects_out_of_range(self):
         with pytest.raises(SystemExit):
+            self._parse(["--min-fan-duty", "-1"])
+        with pytest.raises(SystemExit):
             self._parse(["--min-fan-duty", "101"])
+
+    def test_fan_diagnostics(self):
+        args = self._parse(["--fan-diagnostics"])
+        assert args.fan_diagnostics is True
+
+    def test_enable_fan_control(self):
+        args = self._parse(["--enable-fan-control"])
+        assert args.enable_fan_control is True
+
+    def test_fan_control_vendor(self):
+        args = self._parse(["--fan-control-vendor", "supermicro"])
+        assert args.fan_control_vendor == "supermicro"
+
+    def test_fan_control_vendor_inspur(self):
+        args = self._parse(["--fan-control-vendor", "inspur"])
+        assert args.fan_control_vendor == "inspur"
+
+    def test_classic_ui(self):
+        args = self._parse(["--classic-ui"])
+        assert args.classic_ui is True
 
     def test_debug_file(self):
         args = self._parse(["--debug-file", "/tmp/test.log"])

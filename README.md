@@ -6,9 +6,10 @@
 
 - CPU 监控：温度、频率、利用率、RAPL 功率。
 - GPU/组件功率监控：新增 `CompPower` 数据源。
-- 风扇转速显示：保留原有 psutil fan RPM 读取能力。
-- 风扇控制菜单：已禁用；本版本不再写任何风扇控制目标。
+- 风扇转速显示：优先读取 Inspur BMC API，失败后回退到 psutil/IPMI sensor。
+- 风扇控制菜单：默认隐藏；只有显式传入 `--enable-fan-control` 后才会暴露受支持目标。
 - 终端一次性输出：`--terminal` 和 `--json` 已接入 `CompPower`。
+- 默认 UI：显示 Total/CPU/Fan/GPU/Temp 的极简监视器；原始图形菜单使用 `--classic-ui`。
 - 压测：保留上游内置 CPU stress 和外部 `stress`/`stress-ng` 支持。
 
 ## 新增数据源
@@ -19,6 +20,7 @@
 
 - Linux hwmon：`/sys/class/hwmon/hwmon*/power*_input`
 - NVIDIA GPU：`nvidia-smi --query-gpu=index,name,power.draw --format=csv,noheader,nounits`
+- Inspur BMC API：`/api/sensors/temAndPowerReading` 中的功率传感器
 - IPMI sensor：`ipmitool sensor` 中单位为 `Watts` 或 `W` 的传感器行
 - IPMI DCMI：`ipmitool dcmi power reading`
 
@@ -26,13 +28,47 @@
 
 ### 风扇控制
 
-`Fan Control` 已禁用。本版本不再自动暴露以下任何可写后端：
+`Fan Control` 默认禁用。本版本不再自动暴露以下任何可写后端：
 
 - Dell iDRAC raw IPMI fan command，仅在 DMI 厂商信息包含 Dell 时显示。
 - Supermicro raw IPMI fan command，仅在 DMI 厂商信息包含 Supermicro 或 Super Micro 时显示。
 - 可写的 Linux hwmon PWM 控制文件：`pwmN` 和可选的 `pwmN_enable`。
+- Inspur BMC Web API，仅在 DMI 匹配或显式传入 `--fan-control-vendor inspur` 时显示。
 
-不会暴露任何风扇控制入口，因为部分机器的 hwmon PWM 可能实际控制 PSU 风扇或风扇板，而不是机箱风扇。当前只保留风扇转速和风扇功耗的只读监控。
+默认不会暴露任何风扇控制入口，因为部分机器的 hwmon PWM/IPMI raw 命令可能实际控制 PSU 风扇或风扇板，而不是机箱风扇。需要写风扇 duty 时，必须同时传入 `--enable-fan-control` 和匹配的 vendor 参数。
+
+### 101 丐版风扇监视器
+
+目前只在 101 环境部署和验证。由于本机相关 IPMI 路径不稳定，101 的 Total/CPU/Fan/GPU/Temp 和 Inspur 风扇控制走 BMC Web API，而不是依赖 IPMI fan control。
+
+推荐运行方式：
+
+```bash
+cd ~/s-tui2
+S_TUI_BMC_USERNAME=<username> \
+S_TUI_BMC_PASSWORD=<password> \
+python -m s_tui.s_tui --enable-fan-control --fan-control-vendor inspur
+```
+
+`S_TUI_BMC_URL` 是可选项。默认会通过 `ipmitool lan print`、`sudo -n ipmitool lan print` 或 `sudo ipmitool lan print` 自动发现 BMC IP；如果显式传入的 URL 已经过期，程序会继续尝试自动发现到的候选 URL。
+
+需要固定 BMC 地址时可手动指定：
+
+```bash
+cd ~/s-tui2
+S_TUI_BMC_URL=https://<bmc-ip> \
+S_TUI_BMC_USERNAME=<username> \
+S_TUI_BMC_PASSWORD=<password> \
+python -m s_tui.s_tui --enable-fan-control --fan-control-vendor inspur
+```
+
+技术路径：
+
+- BMC 登录：`/api/randomtag` 和 `/api/session`。
+- 风扇读数：`/api/status/fan_info`。
+- 温度/功率读数：`/api/sensors/temAndPowerReading`。
+- 风扇模式和 duty：`/api/settings/fans-mode`、`/api/settings/fan/<id>`。
+- 只有在用户显式开启风扇控制后才会写 BMC API；普通监视读数只做只读请求。
 
 ## 安装和运行
 
@@ -147,7 +183,7 @@ combined CompPower: GPU0:NVIDIA H200 NVL: about 72.7 W
 
 ```bash
 python -m ruff check s_tui tests
-python -m pytest tests/test_component_power_source.py tests/test_fan_control_menu.py tests/test_cli.py -q
+python -m pytest tests/test_simple_tui.py tests/test_power_totals.py tests/test_fan_control_menu.py tests/test_fan_source.py tests/test_component_power_source.py tests/test_cli.py -q
 python -m pytest tests/ -m 'not hardware' -q
 ```
 
@@ -180,18 +216,19 @@ python -m s_tui.s_tui
 可选硬件工具：
 
 - `nvidia-smi`：读取 NVIDIA GPU 功率。
-- `ipmitool`：读取 IPMI 功率，或在受支持机器上做风扇控制。
+- `ipmitool`：读取 IPMI 功率/风扇传感器，或用于自动发现本机 BMC IP。
 - `lm-sensors`/hwmon：暴露温度、风扇和功率传感器。
 
 ## 风扇控制安全说明
 
 风扇调速可能影响机器散热。本版本采取以下保护：
 
-- 不暴露任何风扇写入口。
-- 不自动发现 hwmon PWM 或 IPMI raw 风扇控制目标。
-- 手动 duty 必须在 `--min-fan-duty` 和 100% 之间，默认最低 20%。
-- Dell/Supermicro raw IPMI 控制只在 DMI 厂商匹配时显示。
-- 未知厂商机器不会暴露 Dell/Supermicro raw 目标。
+- 默认不暴露任何风扇写入口，必须显式传入 `--enable-fan-control`。
+- 默认不自动发现 hwmon PWM 或 IPMI raw 风扇控制目标。
+- 手动 duty 必须在 `--min-fan-duty` 和 100% 之间，默认最低 0%。
+- Dell/Supermicro raw IPMI 控制只在 DMI 厂商匹配或显式指定 vendor 时显示。
+- Inspur 风扇控制走 BMC Web API，只在显式开启并匹配/指定 `inspur` vendor 时显示。
+- 未知厂商机器不会自动暴露 Dell/Supermicro/Inspur 写目标。
 - Giga Computing 的 `fdu-gpu-1` 当前不会显示 raw IPMI fan target。
 
 在新机器上不使用本工具做风扇控制；请通过 BMC Web UI 或厂商文档确认具体风扇域后再操作。

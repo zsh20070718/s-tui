@@ -44,7 +44,9 @@ from s_tui.fan_control_menu import (
     MAX_FAN_DUTY,
     MIN_FAN_DUTY,
     FanControlMenu,
+    discover_fan_control_targets,
 )
+from s_tui.fan_diagnostics import build_fan_diagnostics
 from s_tui.help_menu import HELP_MESSAGE, HelpMenu
 
 # Helpers
@@ -75,6 +77,7 @@ from s_tui.power_profile_menu import (
 )
 from s_tui.power_totals import collect_power_totals, format_power
 from s_tui.sensors_menu import SensorsMenu
+from s_tui.simple_tui import run_simple_power_fan_ui
 from s_tui.sources.component_power_source import ComponentPowerSource
 from s_tui.sources.fan_source import FanSource
 from s_tui.sources.freq_source import FreqSource
@@ -99,6 +102,7 @@ ZERO_TIME = seconds_to_text(0)
 DEFAULT_LOG_FILE = "_s-tui.log"
 
 DEFAULT_CSV_FILE = "s-tui_log_" + time.strftime("%Y-%m-%d_%H_%M_%S") + ".csv"
+DEFAULT_REFRESH_RATE = "0.5"
 
 VERSION_MESSAGE = (
     "s-tui "
@@ -250,7 +254,8 @@ class GraphView(urwid.WidgetPlaceholder):
         self.governor_view = urwid.Text("", align="center")
         self.machine_power_view = urwid.Text("", align="center")
         self.fan_power_view = urwid.Text("", align="center")
-        self.cpu_gpu_power_view = urwid.Text("", align="center")
+        self.cpu_power_view = urwid.Text("", align="center")
+        self.gpu_power_view = urwid.Text("", align="center")
         self._update_cpu_policy()
         self._update_power_totals()
         self.refresh_rate_ctrl = urwid.Edit(
@@ -304,7 +309,7 @@ class GraphView(urwid.WidgetPlaceholder):
             else:
                 self.controller.refresh_rate = new_refresh_rate
         except ValueError:
-            self.controller.refresh_rate = "2.0"
+            self.controller.refresh_rate = DEFAULT_REFRESH_RATE
 
     def update_displayed_information(self):
         """Update all the graphs that are being displayed"""
@@ -487,9 +492,25 @@ class GraphView(urwid.WidgetPlaceholder):
             self._open_menu_overlay(self.power_profile_menu)
 
     def _create_fan_control_menu(self) -> FanControlMenu | None:
-        """Keep fan control hidden; automatic target discovery is unsafe."""
-        logging.info("Fan control disabled: automatic targets may be PSU fans")
-        return None
+        """Create fan control only after explicit user opt-in."""
+        if not self.controller.args.enable_fan_control:
+            logging.info("Fan control disabled by default")
+            return None
+
+        targets = discover_fan_control_targets(
+            ipmitool_exe=self.controller.ipmitool_exe,
+            allow_unsafe=True,
+            ipmi_vendor=self.controller.args.fan_control_vendor,
+        )
+        if not targets:
+            logging.info("Fan control menu: nothing controllable, hiding")
+            return None
+        return FanControlMenu(
+            return_fn=self.on_menu_close,
+            targets=targets,
+            ipmitool_exe=self.controller.ipmitool_exe,
+            min_duty=self.controller.min_fan_duty,
+        )
 
     def on_fan_control_menu_open(self, widget):
         """Open Fan Control menu"""
@@ -612,7 +633,8 @@ class GraphView(urwid.WidgetPlaceholder):
         totals = collect_power_totals(self.controller.sources)
         self.machine_power_view.set_text(format_power(totals.machine))
         self.fan_power_view.set_text(format_power(totals.fan))
-        self.cpu_gpu_power_view.set_text(format_power(totals.cpu_gpu))
+        self.cpu_power_view.set_text(format_power(totals.cpu))
+        self.gpu_power_view.set_text(format_power(totals.gpu))
 
     @staticmethod
     def _generate_cpu_stats():
@@ -695,8 +717,10 @@ class GraphView(urwid.WidgetPlaceholder):
             self.machine_power_view,
             urwid.Text(("bold text", "Fan Power"), align="center"),
             self.fan_power_view,
-            urwid.Text(("bold text", "CPU/GPU Power"), align="center"),
-            self.cpu_gpu_power_view,
+            urwid.Text(("bold text", "CPU Power"), align="center"),
+            self.cpu_power_view,
+            urwid.Text(("bold text", "GPU Power"), align="center"),
+            self.gpu_power_view,
             urwid.Divider(),
         ]
         text_col = ViListBox(
@@ -1036,7 +1060,7 @@ class GraphController:
 
         if self.args.debug_run:
             # refresh rate is a string in float format
-            self.debug_run_counter += int(float(self.refresh_rate))
+            self.debug_run_counter += float(self.refresh_rate)
             if self.debug_run_counter >= 8:
                 self.exit_program()
 
@@ -1046,6 +1070,9 @@ def main():
     # Print version and exit
     if args.version:
         print(VERSION_MESSAGE)
+        sys.exit(0)
+    if args.fan_diagnostics:
+        print(build_fan_diagnostics(ipmi_vendor=args.fan_control_vendor))
         sys.exit(0)
 
     # Setup logging util
@@ -1084,6 +1111,10 @@ def main():
         elif args.json:
             output_to_json(sources)
 
+    if not args.classic_ui:
+        run_simple_power_fan_ui(args)
+        return
+
     global graph_controller
     graph_controller = GraphController(args)
     atexit.register(graph_controller.stress_controller.kill_stress_process)
@@ -1095,8 +1126,10 @@ def _min_fan_duty_arg(value: str) -> int:
         min_duty = int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be an integer") from exc
-    if min_duty < 1 or min_duty > MAX_FAN_DUTY:
-        raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_FAN_DUTY}")
+    if min_duty < MIN_FAN_DUTY or min_duty > MAX_FAN_DUTY:
+        raise argparse.ArgumentTypeError(
+            f"must be between {MIN_FAN_DUTY} and {MAX_FAN_DUTY}"
+        )
     return min_duty
 
 
@@ -1167,15 +1200,43 @@ def get_args():
         "-r",
         "--refresh-rate",
         dest="refresh_rate",
-        default="2.0",
-        help="Refresh rate in seconds. Default: 2.0",
+        default=DEFAULT_REFRESH_RATE,
+        help=f"Refresh rate in seconds. Default: {DEFAULT_REFRESH_RATE}",
     )
     parser.add_argument(
         "--min-fan-duty",
         dest="min_fan_duty",
         type=_min_fan_duty_arg,
         default=MIN_FAN_DUTY,
-        help="Minimum manual fan duty percent. Default: 20",
+        help=f"Minimum manual fan duty percent. Default: {MIN_FAN_DUTY}",
+    )
+    parser.add_argument(
+        "--fan-diagnostics",
+        dest="fan_diagnostics",
+        default=False,
+        action="store_true",
+        help="Print read-only fan, GPU power, and IPMI diagnostics, then exit",
+    )
+    parser.add_argument(
+        "--enable-fan-control",
+        dest="enable_fan_control",
+        default=False,
+        action="store_true",
+        help="Show the fan control menu. Writes are explicit and disabled by default",
+    )
+    parser.add_argument(
+        "--fan-control-vendor",
+        dest="fan_control_vendor",
+        choices=("auto", "dell", "supermicro", "inspur"),
+        default="auto",
+        help="Force fan control target family when DMI vendor is unavailable",
+    )
+    parser.add_argument(
+        "--classic-ui",
+        dest="classic_ui",
+        default=False,
+        action="store_true",
+        help="Use the original graph/menu interface instead of the minimal UI",
     )
     args = parser.parse_args()
     return args

@@ -6,6 +6,7 @@ from s_tui.sources.component_power_source import (
     ComponentPowerSource,
     PowerReading,
     _read_hwmon_power,
+    _read_inspur_bmc_power,
     _read_ipmi_dcmi_power,
     _read_ipmi_sensor_power,
     _read_nvidia_power,
@@ -71,7 +72,41 @@ def test_read_ipmi_dcmi_power_parses_instantaneous_reading():
     assert readings == [PowerReading("IPMI:DCMI", 287.0)]
 
 
-def test_component_power_source_updates_and_marks_missing(mocker):
+def test_read_inspur_bmc_power_parses_watt_sensors():
+    payload = [
+        {
+            "name": "Total_Power",
+            "unit": "watts",
+            "reading": 608,
+            "sensor_state": 1,
+            "accessible": 0,
+        },
+        {
+            "name": "CPU_Power",
+            "unit": "watts",
+            "reading": "264",
+            "sensor_state": 1,
+            "accessible": 0,
+        },
+        {
+            "name": "PSU1_PIN",
+            "unit": "watts",
+            "reading": 0,
+            "sensor_state": 1,
+            "accessible": 213,
+        },
+        {"name": "Inlet_Temp", "unit": "deg_c", "reading": 24},
+    ]
+
+    readings = _read_inspur_bmc_power(lambda path: payload)
+
+    assert readings == [
+        PowerReading("BMC:Total_Power", 608.0),
+        PowerReading("BMC:CPU_Power", 264.0),
+    ]
+
+
+def test_component_power_source_updates_and_marks_missing(monkeypatch):
     samples = iter(
         [
             [PowerReading("GPU0:NVIDIA A100", 120.0)],
@@ -79,9 +114,9 @@ def test_component_power_source_updates_and_marks_missing(mocker):
             [],
         ]
     )
-    mocker.patch(
+    monkeypatch.setattr(
         "s_tui.sources.component_power_source._probe_power_readings",
-        side_effect=lambda: next(samples),
+        lambda: next(samples),
     )
 
     source = ComponentPowerSource()

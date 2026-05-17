@@ -1,7 +1,27 @@
-"""Tests for FanSource with mocked psutil."""
+"""Tests for FanSource with mocked psutil and IPMI inputs."""
 
-from s_tui.sources.fan_source import FanSource
-from tests.conftest import SensorFan
+from subprocess import CompletedProcess
+
+import pytest
+
+from s_tui.sources.fan_source import (
+    FanReading,
+    FanSource,
+    _read_inspur_bmc_fans,
+    _read_ipmi_fans,
+)
+from tests.conftest import SensorFan, make_fans_dict
+
+
+def _completed(stdout="", stderr="", returncode=0):
+    return CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
+
+
+@pytest.fixture
+def mock_sensors_fans(monkeypatch):
+    fans = make_fans_dict(count=1)
+    monkeypatch.setattr("psutil.sensors_fans", lambda: fans)
+    return fans
 
 
 class TestFanSourceInit:
@@ -33,22 +53,31 @@ class TestFanSourceUpdate:
         readings = src.get_reading_list()
         assert readings[0] == 1200
 
-    def test_filters_unreasonable_speeds(self, mocker):
+    def test_keeps_server_fan_speeds_above_10k_rpm(self, monkeypatch):
         fans = {
             "hw": [
                 SensorFan(label="f0", current=1200),
-                SensorFan(label="f1", current=99999),
+                SensorFan(label="f1", current=23000),
             ]
         }
-        mocker.patch("psutil.sensors_fans", return_value=fans)
+        monkeypatch.setattr("psutil.sensors_fans", lambda: fans)
         src = FanSource()
         src.update()
         readings = src.get_reading_list()
-        # Both sensors are in the list, but the unreasonable one is marked unavailable
         assert len(readings) == 2
         assert readings[0] == 1200
+        assert readings[1] == 23000
         assert src.sensor_available[0] is True
-        assert src.sensor_available[1] is False
+        assert src.sensor_available[1] is True
+
+    def test_filters_unreasonable_speeds(self, monkeypatch):
+        fans = {"hw": [SensorFan(label="f0", current=99999)]}
+        monkeypatch.setattr("psutil.sensors_fans", lambda: fans)
+        src = FanSource()
+
+        src.update()
+
+        assert src.sensor_available[0] is False
 
     def test_edge_triggered_always_false(self, mock_sensors_fans):
         src = FanSource()
@@ -60,12 +89,55 @@ class TestFanSourceUpdate:
 
 
 class TestFanSourceUnavailable:
-    def test_no_fans(self, mocker):
-        mocker.patch("psutil.sensors_fans", return_value={})
+    def test_no_fans(self, monkeypatch):
+        monkeypatch.setattr("psutil.sensors_fans", lambda: {})
+        monkeypatch.setattr("s_tui.sources.fan_source._read_ipmi_fans", lambda: [])
         src = FanSource()
         assert src.get_is_available() is False
 
-    def test_attribute_error(self, mocker):
-        mocker.patch("psutil.sensors_fans", side_effect=AttributeError)
+    def test_attribute_error(self, monkeypatch):
+        def raise_attribute_error():
+            raise AttributeError
+
+        monkeypatch.setattr("psutil.sensors_fans", raise_attribute_error)
+        monkeypatch.setattr("s_tui.sources.fan_source._read_ipmi_fans", lambda: [])
         src = FanSource()
         assert src.get_is_available() is False
+
+
+def test_read_ipmi_fans_parses_rpm_rows(monkeypatch):
+    monkeypatch.setattr("s_tui.sources.fan_source.ipmi_access_configured", lambda: True)
+
+    def runner(cmd, **kwargs):
+        return _completed(
+            stdout=(
+                "FAN1 | 7200.000 | RPM | ok\n"
+                "PS1 Fan | 9800.000 | RPM | ok\n"
+                "Temp | 35.000 | degrees C | ok\n"
+            )
+        )
+
+    readings = _read_ipmi_fans("/usr/bin/ipmitool", runner)
+
+    assert readings == [
+        FanReading("IPMI:FAN1", 7200),
+        FanReading("IPMI:PS1 Fan", 9800),
+    ]
+
+
+def test_read_inspur_bmc_fans_parses_fan_info():
+    payload = {
+        "fans": [
+            {"fan_name": "FAN0_F_Speed", "speed_rpm": 13300, "status": "OK"},
+            {"fan_name": "FAN0_R_Speed", "speed_rpm": 12600, "status": "OK"},
+            {"fan_name": "FAN1_F_Speed", "speed_rpm": "N/A", "status": "OK"},
+            {"fan_name": "FAN1_R_Speed", "speed_rpm": 0, "status": "Absent"},
+        ]
+    }
+
+    readings = _read_inspur_bmc_fans(lambda path: payload)
+
+    assert readings == [
+        FanReading("BMC:FAN0_F_Speed", 13300),
+        FanReading("BMC:FAN0_R_Speed", 12600),
+    ]

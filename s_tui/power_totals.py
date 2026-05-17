@@ -14,6 +14,8 @@ class PowerTotals:
 
     machine: float | None
     fan: float | None
+    cpu: float | None
+    gpu: float | None
     cpu_gpu: float | None
 
 
@@ -181,14 +183,20 @@ def _component_gpu_total(readings: list[_Reading]) -> float | None:
     return sum(r.watts for r in gpu_readings)
 
 
-def _cpu_gpu_total(
+def _cpu_total(
     rapl_readings: list[_Reading], component_readings: list[_Reading]
 ) -> float | None:
     cpu_total = _rapl_cpu_total(rapl_readings)
     if cpu_total is None:
         cpu_total = _component_cpu_total(component_readings)
-    gpu_total = _component_gpu_total(component_readings)
+    return cpu_total
 
+
+def _gpu_total(component_readings: list[_Reading]) -> float | None:
+    return _component_gpu_total(component_readings)
+
+
+def _cpu_gpu_total(cpu_total: float | None, gpu_total: float | None) -> float | None:
     if cpu_total is None and gpu_total is None:
         return None
     return (cpu_total or 0.0) + (gpu_total or 0.0)
@@ -206,10 +214,14 @@ def collect_power_totals(sources: Iterable[object]) -> PowerTotals:
         elif source_name == "CompPower":
             component_readings = _source_readings(source)
 
+    cpu_total = _cpu_total(rapl_readings, component_readings)
+    gpu_total = _gpu_total(component_readings)
     return PowerTotals(
         machine=_machine_total(component_readings),
         fan=_fan_total(component_readings),
-        cpu_gpu=_cpu_gpu_total(rapl_readings, component_readings),
+        cpu=cpu_total,
+        gpu=gpu_total,
+        cpu_gpu=_cpu_gpu_total(cpu_total, gpu_total),
     )
 
 
