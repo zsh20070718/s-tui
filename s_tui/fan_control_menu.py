@@ -288,10 +288,8 @@ def discover_fan_control_targets(
     hwmon_base_path: str = "/sys/class/hwmon",
     dmi_base_path: str = "/sys/class/dmi/id",
 ) -> list[FanControlTarget]:
-    """Discover fan control targets exposed by supported backends."""
-    targets = _discover_ipmi_targets(ipmitool_exe, dmi_base_path)
-    targets.extend(_discover_hwmon_targets(hwmon_base_path))
-    return targets
+    """Return no targets; automatic fan control discovery is unsafe."""
+    return []
 
 
 class FanControlMenu:

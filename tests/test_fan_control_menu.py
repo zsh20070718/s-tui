@@ -9,6 +9,7 @@ from s_tui.fan_control_menu import (
     _parse_duty_percent,
     apply_fan_target,
     build_ipmi_commands,
+    discover_fan_control_targets,
 )
 
 
@@ -120,6 +121,19 @@ def test_discover_ipmi_targets_hides_unknown_vendor(tmp_path):
 
     targets = _discover_ipmi_targets(
         ipmitool_exe="/usr/bin/ipmitool",
+        dmi_base_path=str(tmp_path),
+    )
+
+    assert targets == []
+
+
+def test_discover_fan_control_targets_is_disabled(tmp_path):
+    (tmp_path / "hwmon0").mkdir()
+    (tmp_path / "hwmon0" / "pwm1").write_text("255")
+
+    targets = discover_fan_control_targets(
+        ipmitool_exe="/usr/bin/ipmitool",
+        hwmon_base_path=str(tmp_path),
         dmi_base_path=str(tmp_path),
     )
 
