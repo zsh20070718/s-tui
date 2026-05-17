@@ -40,6 +40,7 @@ import urwid
 from s_tui.about_menu import AboutMenu
 from s_tui.builtin_stress_menu import BuiltinStressMenu
 from s_tui.builtin_stresser import BuiltinStresser
+from s_tui.gpu_stresser import GpuStresser
 from s_tui.fan_control_menu import (
     MAX_FAN_DUTY,
     MIN_FAN_DUTY,
@@ -81,6 +82,11 @@ from s_tui.simple_tui import run_simple_power_fan_ui
 from s_tui.sources.component_power_source import ComponentPowerSource
 from s_tui.sources.fan_source import FanSource
 from s_tui.sources.freq_source import FreqSource
+from s_tui.sources.nvidia_gpu_source import (
+    GpuPowerSource,
+    GpuTempSource,
+    GpuUtilSource,
+)
 from s_tui.sources.rapl_power_source import RaplPowerSource
 from s_tui.sources.script_hook_loader import ScriptHookLoader
 from s_tui.sources.temp_source import TempSource
@@ -153,16 +159,20 @@ class StressController:
     and operation
     """
 
-    def __init__(self, stress_installed):
+    def __init__(self, stress_installed, gpu_stress_available=False):
         self.stress_modes = ["Monitor"]
         self.stress_modes.append("s-tui stress")
 
         if stress_installed:
             self.stress_modes.append("Stress (ext)")
 
+        if gpu_stress_available:
+            self.stress_modes.append("GPU stress")
+
         self.current_mode = self.stress_modes[0]
         self.stress_process = None
         self._builtin_stresser = None
+        self._gpu_stresser = None
 
     def get_modes(self):
         """Returns all possible stress_modes for stress operations"""
@@ -196,6 +206,13 @@ class StressController:
             self._builtin_stresser = BuiltinStresser()
         return self._builtin_stresser
 
+    @property
+    def gpu_stresser(self):
+        """Lazy-init GpuStresser on first use."""
+        if self._gpu_stresser is None:
+            self._gpu_stresser = GpuStresser()
+        return self._gpu_stresser
+
     def kill_stress_process(self):
         """Kills the current running stress process"""
         try:
@@ -205,6 +222,8 @@ class StressController:
         self.stress_process = None
         if self._builtin_stresser is not None:
             self._builtin_stresser.stop()
+        if self._gpu_stresser is not None:
+            self._gpu_stresser.stop()
 
     def start_stress(self, stress_cmd):
         """Starts a new stress process with a given cmd"""
@@ -226,6 +245,14 @@ class StressController:
             self.builtin_stresser.start(num_workers, strategy=strategy)
         except OSError as err:
             logging.error("Unable to start built-in stresser: %s", err)
+            self.current_mode = "Monitor"
+
+    def start_gpu_stress(self):
+        """Starts the built-in GPU stresser (CUDA matmul on every device)."""
+        try:
+            self.gpu_stresser.start()
+        except OSError as err:
+            logging.error("Unable to start GPU stresser: %s", err)
             self.current_mode = "Monitor"
 
 
@@ -845,6 +872,9 @@ class GraphController:
             RaplPowerSource(),
             ComponentPowerSource(),
             FanSource(),
+            GpuUtilSource(),
+            GpuTempSource(),
+            GpuPowerSource(),
         ]
 
         # Load sensors config if available
@@ -888,7 +918,8 @@ class GraphController:
             if self.stress_exe:
                 stress_installed = True
 
-        return StressController(stress_installed)
+        gpu_available = GpuStresser().is_available
+        return StressController(stress_installed, gpu_stress_available=gpu_available)
 
     def __init__(self, args):
         self.conf = None
@@ -989,6 +1020,9 @@ class GraphController:
         elif self.stress_controller.get_current_mode() == "Stress (ext)":
             stress_cmd = self.view.stress_menu.get_stress_cmd()
             self.stress_controller.start_stress(stress_cmd)
+
+        elif self.stress_controller.get_current_mode() == "GPU stress":
+            self.stress_controller.start_gpu_stress()
 
     def save_settings(self):
         """Save the current configuration to a user config file"""
@@ -1105,6 +1139,9 @@ def main():
             RaplPowerSource(),
             ComponentPowerSource(),
             FanSource(),
+            GpuUtilSource(),
+            GpuTempSource(),
+            GpuPowerSource(),
         ]
         if args.terminal:
             output_to_terminal(sources)
