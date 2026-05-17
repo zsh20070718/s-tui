@@ -74,6 +74,7 @@ from s_tui.power_profile_menu import (
     PowerProfileMenu,
     read_available,
 )
+from s_tui.power_totals import collect_power_totals, format_power
 from s_tui.sensors_menu import SensorsMenu
 from s_tui.sources.component_power_source import ComponentPowerSource
 from s_tui.sources.fan_source import FanSource
@@ -248,8 +249,11 @@ class GraphView(urwid.WidgetPlaceholder):
         # general urwid items
         self.clock_view = urwid.Text(ZERO_TIME, align="center")
         self.governor_view = urwid.Text("", align="center")
-        self.epp_view = urwid.Text("", align="center")
+        self.machine_power_view = urwid.Text("", align="center")
+        self.fan_power_view = urwid.Text("", align="center")
+        self.cpu_gpu_power_view = urwid.Text("", align="center")
         self._update_cpu_policy()
+        self._update_power_totals()
         self.refresh_rate_ctrl = urwid.Edit(
             ("Refresh[s]:"), self.controller.refresh_rate
         )
@@ -365,6 +369,7 @@ class GraphView(urwid.WidgetPlaceholder):
                 logging.debug("Summary update failed")
 
         self._update_cpu_policy()
+        self._update_power_totals()
 
         # Only update clock if not is stress mode
         if self.controller.stress_controller.get_current_mode() != "Monitor":
@@ -608,15 +613,18 @@ class GraphView(urwid.WidgetPlaceholder):
         return controls
 
     def _update_cpu_policy(self):
-        """Read CPU governor and energy performance preference from sysfs."""
+        """Read CPU governor from sysfs."""
         try:
             self.governor_view.set_text(cat(SYSFS_GOVERNOR, binary=False).strip())
         except OSError:
             self.governor_view.set_text("N/A")
-        try:
-            self.epp_view.set_text(cat(SYSFS_EPP, binary=False).strip())
-        except OSError:
-            self.epp_view.set_text("N/A")
+
+    def _update_power_totals(self):
+        """Update high-level power totals shown in the side panel."""
+        totals = collect_power_totals(self.controller.sources)
+        self.machine_power_view.set_text(format_power(totals.machine))
+        self.fan_power_view.set_text(format_power(totals.fan))
+        self.cpu_gpu_power_view.set_text(format_power(totals.cpu_gpu))
 
     @staticmethod
     def _generate_cpu_stats():
@@ -695,8 +703,12 @@ class GraphView(urwid.WidgetPlaceholder):
             urwid.Text(("bold text", "Governor"), align="center"),
             self.governor_view,
             urwid.Text(""),
-            urwid.Text(("bold text", "Energy Pref"), align="center"),
-            self.epp_view,
+            urwid.Text(("bold text", "Machine Power"), align="center"),
+            self.machine_power_view,
+            urwid.Text(("bold text", "Fan Power"), align="center"),
+            self.fan_power_view,
+            urwid.Text(("bold text", "CPU/GPU Power"), align="center"),
+            self.cpu_gpu_power_view,
             urwid.Divider(),
         ]
         text_col = ViListBox(

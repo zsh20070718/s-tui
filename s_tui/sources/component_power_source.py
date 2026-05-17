@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from io import StringIO
@@ -41,8 +42,13 @@ from s_tui.helper_functions import cat, which
 from s_tui.sources.source import Source
 
 PROBE_TIMEOUT = 2.0
+IPMI_SENSOR_TIMEOUT = 10.0
+IPMI_SENSOR_CACHE_SECONDS = 10.0
 _POWER_INPUT_RE = re.compile(r"power(\d+)_input$")
 _FLOAT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+_ipmi_sensor_cache_key: str | None = None
+_ipmi_sensor_cache_time = 0.0
+_ipmi_sensor_cache_result: subprocess.CompletedProcess[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -160,17 +166,35 @@ def _read_ipmi_sensor_power(
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> list[PowerReading]:
     """Read IPMI sensor rows whose unit is watts."""
+    global _ipmi_sensor_cache_key, _ipmi_sensor_cache_result, _ipmi_sensor_cache_time
+
     exe = ipmitool_exe or which("ipmitool")
     if exe is None:
         return []
 
     try:
-        result = runner(
-            [exe, "sensor"],
-            capture_output=True,
-            text=True,
-            timeout=PROBE_TIMEOUT,
-        )
+        now = time.monotonic()
+        if (
+            runner is subprocess.run
+            and _ipmi_sensor_cache_key == exe
+            and _ipmi_sensor_cache_result is not None
+            and now - _ipmi_sensor_cache_time < IPMI_SENSOR_CACHE_SECONDS
+        ):
+            result = _ipmi_sensor_cache_result
+        else:
+            result = runner(
+                [exe, "sensor"],
+                capture_output=True,
+                text=True,
+                timeout=IPMI_SENSOR_TIMEOUT,
+            )
+            if runner is subprocess.run and result.returncode == 0:
+                _ipmi_sensor_cache_key = exe
+                _ipmi_sensor_cache_result = result
+                _ipmi_sensor_cache_time = now
+    except subprocess.TimeoutExpired:
+        logging.debug("ipmitool sensor timed out for component power", exc_info=True)
+        return []
     except (OSError, subprocess.SubprocessError):
         logging.debug("Unable to run ipmitool sensor for power", exc_info=True)
         return []
