@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import logging
+import queue
 import sys
+import threading
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 import urwid
 
@@ -230,6 +233,122 @@ def format_temperature_details(temperatures: list[tuple[str, float]]) -> str:
     return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class SimpleDisplaySnapshot:
+    total_text: str
+    details_text: str
+    temp_text: str
+    sensor_status_text: str = ""
+    sensor_status_is_error: bool = False
+
+
+def _empty_display_snapshot(error: str = "") -> SimpleDisplaySnapshot:
+    return SimpleDisplaySnapshot(
+        total_text="Total: N/A",
+        details_text=format_power_details([], "N/A"),
+        temp_text=format_temperature_details([]),
+        sensor_status_text=error,
+        sensor_status_is_error=bool(error),
+    )
+
+
+def _collect_display_snapshot(sources: list[object]) -> SimpleDisplaySnapshot:
+    for source in sources:
+        if not source.get_is_available():
+            continue
+        try:
+            source.update()
+        except (OSError, TypeError, ValueError):
+            logging.debug("Failed to update %s", source, exc_info=True)
+
+    totals = collect_power_totals(sources)
+    return SimpleDisplaySnapshot(
+        total_text=f"Total: {format_power(totals.machine)}",
+        details_text=format_power_details(sources, read_current_fan_percent()),
+        temp_text=format_temperature_details(read_key_temperatures()),
+    )
+
+
+class SimpleDisplaySampler:
+    def __init__(
+        self,
+        source_factory: Callable[[], list[object]] | None = None,
+        refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
+    ) -> None:
+        self.source_factory = source_factory or _build_power_sources
+        self.refresh_seconds = refresh_seconds
+        self._snapshots: queue.Queue[SimpleDisplaySnapshot] = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="simple-display-sampler",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float | None = 1.0) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    def get_latest_snapshot(self) -> SimpleDisplaySnapshot | None:
+        try:
+            return self._snapshots.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _publish_snapshot(self, snapshot: SimpleDisplaySnapshot) -> None:
+        while True:
+            try:
+                self._snapshots.put_nowait(snapshot)
+                return
+            except queue.Full:
+                try:
+                    self._snapshots.get_nowait()
+                except queue.Empty:
+                    continue
+
+    def _error_snapshot(
+        self,
+        last_good: SimpleDisplaySnapshot | None,
+        err: BaseException,
+    ) -> SimpleDisplaySnapshot:
+        error_text = f"sampling error: {err}"
+        if last_good is None:
+            return _empty_display_snapshot(error_text)
+        return replace(
+            last_good,
+            sensor_status_text=error_text,
+            sensor_status_is_error=True,
+        )
+
+    def _run(self) -> None:
+        last_good: SimpleDisplaySnapshot | None = None
+        try:
+            sources = self.source_factory()
+        except Exception as err:
+            logging.debug("Failed to build simple TUI sources", exc_info=True)
+            self._publish_snapshot(self._error_snapshot(last_good, err))
+            self._stop_event.wait(self.refresh_seconds)
+            return
+
+        while not self._stop_event.is_set():
+            try:
+                snapshot = _collect_display_snapshot(sources)
+            except Exception as err:
+                logging.debug("Failed to collect simple TUI snapshot", exc_info=True)
+                snapshot = self._error_snapshot(last_good, err)
+            else:
+                last_good = snapshot
+            self._publish_snapshot(snapshot)
+            self._stop_event.wait(self.refresh_seconds)
+
+
 class DirectDutyEdit(urwid.Edit):
     """An edit box that submits the entered duty on Enter."""
 
@@ -261,6 +380,7 @@ class SimplePowerFanView(urwid.WidgetWrap):
         self.total_text = urwid.Text("Total: N/A")
         self.details_text = urwid.Text("")
         self.temp_text = urwid.Text("")
+        self.sensor_status_text = urwid.Text("")
         self.status_text = urwid.Text("")
         self.duty_edit = DirectDutyEdit(self.on_duty_submit)
 
@@ -272,6 +392,7 @@ class SimplePowerFanView(urwid.WidgetWrap):
             self.details_text,
             urwid.Divider(),
             self.temp_text,
+            self.sensor_status_text,
             urwid.Divider(),
             self.duty_edit,
             urwid.Text("q: quit, a: auto, f: full"),
@@ -279,21 +400,17 @@ class SimplePowerFanView(urwid.WidgetWrap):
         ]
         super().__init__(urwid.Filler(urwid.Pile(rows), valign="top", top=1))
 
-    def update_displayed_information(self) -> None:
-        for source in self.sources:
-            if not source.get_is_available():
-                continue
-            try:
-                source.update()
-            except (OSError, TypeError, ValueError):
-                logging.debug("Failed to update %s", source, exc_info=True)
+    def apply_snapshot(self, snapshot: SimpleDisplaySnapshot) -> None:
+        self.total_text.set_text(snapshot.total_text)
+        self.details_text.set_text(snapshot.details_text)
+        self.temp_text.set_text(snapshot.temp_text)
+        if snapshot.sensor_status_is_error:
+            self.sensor_status_text.set_text(("high temp txt", snapshot.sensor_status_text))
+        else:
+            self.sensor_status_text.set_text(snapshot.sensor_status_text)
 
-        totals = collect_power_totals(self.sources)
-        self.total_text.set_text(f"Total: {format_power(totals.machine)}")
-        self.details_text.set_text(
-            format_power_details(self.sources, read_current_fan_percent())
-        )
-        self.temp_text.set_text(format_temperature_details(read_key_temperatures()))
+    def update_displayed_information(self) -> None:
+        self.apply_snapshot(_collect_display_snapshot(self.sources))
 
     def _set_status(self, text: str, error: bool = False) -> None:
         self.status_text.set_text(("high temp txt", text) if error else text)
@@ -354,7 +471,6 @@ def _build_power_sources() -> list[object]:
 
 def run_simple_power_fan_ui(args: object) -> None:
     """Run the minimal terminal interface."""
-    sources = _build_power_sources()
     targets = []
     if getattr(args, "enable_fan_control", False):
         targets = discover_fan_control_targets(
@@ -362,26 +478,34 @@ def run_simple_power_fan_ui(args: object) -> None:
             ipmi_vendor=getattr(args, "fan_control_vendor", "auto"),
         )
     fan_target = select_default_fan_target(targets)
-    view = SimplePowerFanView(sources, fan_target)
-    view.update_displayed_information()
 
     if not sys.stdin.isatty():
+        view = SimplePowerFanView(_build_power_sources(), fan_target)
+        view.update_displayed_information()
         print(view.total_text.get_text()[0])
         print(view.details_text.get_text()[0])
         print(view.temp_text.get_text()[0])
         return
 
     refresh_rate = _refresh_seconds(getattr(args, "refresh_rate", "0.5"))
+    view = SimplePowerFanView([], fan_target)
+    sampler = SimpleDisplaySampler(refresh_seconds=refresh_rate)
     loop = urwid.MainLoop(view, handle_mouse=not getattr(args, "no_mouse", False))
 
     def tick(loop_: urwid.MainLoop, user_data: object | None = None) -> None:
-        view.update_displayed_information()
+        snapshot = sampler.get_latest_snapshot()
+        if snapshot is not None:
+            view.apply_snapshot(snapshot)
         loop_.set_alarm_in(refresh_rate, tick)
 
     def exit_debug_run(loop_: urwid.MainLoop, user_data: object | None = None) -> None:
         raise urwid.ExitMainLoop()
 
-    loop.set_alarm_in(refresh_rate, tick)
+    sampler.start()
+    loop.set_alarm_in(0, tick)
     if getattr(args, "debug_run", False):
         loop.set_alarm_in(8.0, exit_debug_run)
-    loop.run()
+    try:
+        loop.run()
+    finally:
+        sampler.stop(timeout=1.0)

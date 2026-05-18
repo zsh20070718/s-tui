@@ -1,16 +1,23 @@
 """Tests for the minimal power/fan TUI."""
 
+import threading
+import time
+from types import SimpleNamespace
+
 import pytest
 
 from s_tui.fan_control_menu import FanControlTarget
 from s_tui.simple_tui import (
     DirectDutyEdit,
+    SimpleDisplaySampler,
+    SimpleDisplaySnapshot,
     SimplePowerFanView,
     format_power_details,
     format_temperature_details,
     parse_fan_duty,
     read_current_fan_percent,
     read_key_temperatures,
+    run_simple_power_fan_ui,
     select_default_fan_target,
 )
 
@@ -188,3 +195,247 @@ def test_direct_duty_edit_submits_on_enter():
 
     assert result is None
     assert submissions == ["65"]
+
+
+def _wait_for_snapshot(sampler):
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        snapshot = sampler.get_latest_snapshot()
+        if snapshot is not None:
+            return snapshot
+        time.sleep(0.01)
+    raise AssertionError("timed out waiting for sampler snapshot")
+
+
+def test_simple_sampler_collects_off_main_thread(monkeypatch):
+    main_thread_id = threading.get_ident()
+    factory_thread_ids = []
+    update_thread_ids = []
+    updated = threading.Event()
+    source = FakeSource()
+
+    def source_factory():
+        factory_thread_ids.append(threading.get_ident())
+        return [source]
+
+    def update():
+        update_thread_ids.append(threading.get_ident())
+        source.updated = True
+        updated.set()
+
+    source.update = update
+    monkeypatch.setattr("s_tui.simple_tui.read_current_fan_percent", lambda: "58%")
+    monkeypatch.setattr("s_tui.simple_tui.read_key_temperatures", list)
+    sampler = SimpleDisplaySampler(source_factory, refresh_seconds=10.0)
+
+    sampler.start()
+    assert updated.wait(1.0)
+    snapshot = _wait_for_snapshot(sampler)
+    sampler.stop(timeout=0.2)
+
+    assert factory_thread_ids == update_thread_ids
+    assert factory_thread_ids[0] != main_thread_id
+    assert snapshot.total_text == "Total: 576.0 W"
+
+
+def test_simple_sampler_keeps_latest_snapshot_only():
+    sampler = SimpleDisplaySampler(lambda: [], refresh_seconds=10.0)
+    first = SimpleDisplaySnapshot("Total: 1.0 W", "first", "Temp:\n  N/A")
+    second = SimpleDisplaySnapshot("Total: 2.0 W", "second", "Temp:\n  N/A")
+
+    sampler._publish_snapshot(first)
+    sampler._publish_snapshot(second)
+
+    assert sampler.get_latest_snapshot() == second
+    assert sampler.get_latest_snapshot() is None
+
+
+def test_simple_sampler_publishes_stale_snapshot_on_failure(monkeypatch):
+    calls = 0
+    second_call = threading.Event()
+    good = SimpleDisplaySnapshot("Total: 9.0 W", "good details", "good temp")
+
+    def collect(sources):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return good
+        second_call.set()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("s_tui.simple_tui._collect_display_snapshot", collect)
+    sampler = SimpleDisplaySampler(lambda: [], refresh_seconds=0.01)
+
+    sampler.start()
+    assert second_call.wait(1.0)
+    deadline = time.monotonic() + 1.0
+    snapshot = None
+    while time.monotonic() < deadline:
+        candidate = sampler.get_latest_snapshot()
+        if candidate is not None and candidate.sensor_status_is_error:
+            snapshot = candidate
+            break
+        time.sleep(0.01)
+    sampler.stop(timeout=0.2)
+
+    assert snapshot is not None
+    assert snapshot.total_text == "Total: 9.0 W"
+    assert snapshot.details_text == "good details"
+    assert snapshot.sensor_status_text == "sampling error: boom"
+    assert snapshot.sensor_status_is_error is True
+
+
+def test_simple_sampler_publishes_empty_error_before_good_sample(monkeypatch):
+    collected = threading.Event()
+
+    def collect(sources):
+        collected.set()
+        raise RuntimeError("no data")
+
+    monkeypatch.setattr("s_tui.simple_tui._collect_display_snapshot", collect)
+    sampler = SimpleDisplaySampler(lambda: [], refresh_seconds=10.0)
+
+    sampler.start()
+    assert collected.wait(1.0)
+    snapshot = _wait_for_snapshot(sampler)
+    sampler.stop(timeout=0.2)
+
+    assert snapshot.total_text == "Total: N/A"
+    assert snapshot.details_text == "CPU:\n  N/A\nFan:\n  N/A\n  Percent: N/A\nGPU:\n  N/A"
+    assert snapshot.temp_text == "Temp:\n  N/A"
+    assert snapshot.sensor_status_text == "sampling error: no data"
+    assert snapshot.sensor_status_is_error is True
+
+
+def test_sampler_status_does_not_overwrite_fan_status():
+    view = SimplePowerFanView([], None)
+    view._set_status("fan duty set to 58%")
+
+    view.apply_snapshot(
+        SimpleDisplaySnapshot(
+            "Total: 1.0 W",
+            "details",
+            "temp",
+            sensor_status_text="sampling error: boom",
+            sensor_status_is_error=True,
+        )
+    )
+
+    assert _text(view.status_text) == "fan duty set to 58%"
+    assert _text(view.sensor_status_text) == "sampling error: boom"
+
+
+def test_simple_sampler_stop_returns_promptly_when_collection_blocks(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def collect(sources):
+        entered.set()
+        release.wait(1.0)
+        return SimpleDisplaySnapshot("Total: 1.0 W", "details", "temp")
+
+    monkeypatch.setattr("s_tui.simple_tui._collect_display_snapshot", collect)
+    sampler = SimpleDisplaySampler(lambda: [], refresh_seconds=10.0)
+    sampler.start()
+    assert entered.wait(1.0)
+
+    started = time.monotonic()
+    sampler.stop(timeout=0.01)
+    elapsed = time.monotonic() - started
+    try:
+        assert elapsed < 0.2
+        assert sampler._thread is not None
+        assert sampler._thread.is_alive()
+    finally:
+        release.set()
+        sampler.stop(timeout=0.5)
+
+
+def test_run_simple_power_fan_ui_non_tty_stays_synchronous(monkeypatch, capsys):
+    source = FakeSource()
+    monkeypatch.setattr(
+        "s_tui.simple_tui.sys.stdin",
+        SimpleNamespace(isatty=lambda: False),
+    )
+    monkeypatch.setattr("s_tui.simple_tui._build_power_sources", lambda: [source])
+    monkeypatch.setattr("s_tui.simple_tui.read_current_fan_percent", lambda: "58%")
+    monkeypatch.setattr("s_tui.simple_tui.read_key_temperatures", lambda: [("CPU0", 47.0)])
+
+    run_simple_power_fan_ui(SimpleNamespace(enable_fan_control=False))
+
+    assert source.updated is True
+    assert capsys.readouterr().out == (
+        "Total: 576.0 W\n"
+        "CPU:\n"
+        "  CPU: 260.0 W\n"
+        "Fan:\n"
+        "  Power: 108.0 W\n"
+        "  Percent: 58%\n"
+        "GPU:\n"
+        "  GPU0: 87.4 W\n"
+        "Temp:\n"
+        "  CPU0: 47.0 C\n"
+    )
+
+
+def test_run_simple_power_fan_ui_tty_tick_uses_sampler_snapshot(monkeypatch):
+    update_calls = []
+    applied = []
+    stopped = []
+    snapshot = SimpleDisplaySnapshot("Total: 3.0 W", "details", "temp")
+
+    class FakeSampler:
+        def __init__(self, refresh_seconds):
+            self.refresh_seconds = refresh_seconds
+
+        def start(self):
+            pass
+
+        def stop(self, timeout):
+            stopped.append(timeout)
+
+        def get_latest_snapshot(self):
+            return snapshot
+
+    class FakeLoop:
+        def __init__(self, view, handle_mouse):
+            self.view = view
+            self.alarms = []
+
+        def set_alarm_in(self, seconds, callback):
+            self.alarms.append((seconds, callback))
+
+        def run(self):
+            seconds, callback = self.alarms.pop(0)
+            assert seconds == 0
+            callback(self)
+
+    def fail_update(self):
+        update_calls.append(self)
+        raise AssertionError("TTY tick must not sample synchronously")
+
+    def record_snapshot(self, applied_snapshot):
+        applied.append(applied_snapshot)
+
+    monkeypatch.setattr(
+        "s_tui.simple_tui.sys.stdin",
+        SimpleNamespace(isatty=lambda: True),
+    )
+    monkeypatch.setattr("s_tui.simple_tui.discover_fan_control_targets", lambda **kwargs: [])
+    monkeypatch.setattr("s_tui.simple_tui.SimpleDisplaySampler", FakeSampler)
+    monkeypatch.setattr("s_tui.simple_tui.urwid.MainLoop", FakeLoop)
+    monkeypatch.setattr(SimplePowerFanView, "update_displayed_information", fail_update)
+    monkeypatch.setattr(SimplePowerFanView, "apply_snapshot", record_snapshot)
+
+    run_simple_power_fan_ui(
+        SimpleNamespace(
+            enable_fan_control=False,
+            refresh_rate="0.5",
+            no_mouse=False,
+            debug_run=False,
+        )
+    )
+
+    assert update_calls == []
+    assert applied == [snapshot]
+    assert stopped == [1.0]
